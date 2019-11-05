@@ -2,10 +2,13 @@ package logger
 
 import (
 	"fmt"
+	"io/ioutil"
 	"math"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"sort"
 	"time"
 )
 
@@ -14,7 +17,7 @@ var logger *Logger
 type Logger struct {
 	RecordCh  chan *Record
 	FileName string     // 文件名
-	FileDir string     // 文件名
+	FileDir string     // 文件目录全路径
 	File      *os.File
 	Level     Level
 	When      string   // "M", "H", "D", "W"
@@ -25,6 +28,7 @@ type Logger struct {
 	EndCh     chan bool // 文件句柄结束的channel
 	ExitCh    chan bool // 程序退出的channel
 	BackupCount int
+	Regexp     *regexp.Regexp  // 匹配的正则
 }
 
 type Record struct {
@@ -58,8 +62,17 @@ func InitLogger(when string, backupCount int, level Level, fileDir, fileName str
 		BackupCount: backupCount,
 	}
 
+	// 设置日志文件名的正则
+	reg, err := logger.GetRegexp()
+	if err != nil {
+		fmt.Printf("logger.GetRegexp error:%v\n", err)
+		logger.ExitLogger()
+
+	}
+	logger.Regexp = reg
+
 	// 初始化轮转机制
-	err := logger.InitRotate()
+	err = logger.InitRotate()
 	if err != nil {
 		fmt.Printf("%s [%s] %s", logger.GetPreTimeStr(), LevelError.String(), err.Error())
 		return nil, err
@@ -84,6 +97,10 @@ func InitLogger(when string, backupCount int, level Level, fileDir, fileName str
 		for r := range logger.RecordCh {
 			// 判断是否需要轮转
 			if logger.IsRotate() {
+				// 删除一下老的日志
+				logger.deleteOldFiles()
+
+				// 初始化新的日志
 				err := logger.InitRotate()
 				if err != nil {
 					fmt.Printf("logger.InitRotate err:%v\n", err)
@@ -100,14 +117,40 @@ func InitLogger(when string, backupCount int, level Level, fileDir, fileName str
 		}
 	}()
 
-	// TODO 删除老的文件
-	go func() {
+	return logger, nil
+}
 
+func (l *Logger) deleteOldFiles() {
+	// 读取目录下执行类型的文件个数
+	fileList, err := ioutil.ReadDir(l.FileDir)
+	if err != nil {
+		fmt.Printf("ioutil readdir[%s] error:[%v]\n", l.FileDir, err)
+		l.ExitLogger()
+	}
+	// 获取匹配的文件名列表
+	matchFileList := make([]string, 0)
+	for _, file := range fileList {
+		if file.IsDir() {
+			continue
+		}
 
+		if !logger.Regexp.MatchString(file.Name()) {
+			continue
+		}
 
-	}()
+		matchFileList = append(matchFileList, file.Name())
+	}
+	// 排序
+	sort.Strings(matchFileList)
 
-	return  logger, nil
+	// 删除老的文件
+	deleteCount := len(matchFileList) - l.BackupCount
+	if deleteCount > 0 {
+		for _, v := range matchFileList[:deleteCount] {
+			path := filepath.Join(l.FileDir, v)
+			os.Remove(path)
+		}
+	}
 }
 
 // 获取过期的时间间隔
@@ -131,6 +174,22 @@ func ( l *Logger) IsRotate() bool {
 	return t > l.ExpiryTs
 }
 
+func ( l *Logger) Debugf (format string, args ...interface{}) {
+	_, file, line, ok := runtime.Caller(1)
+	if !ok {
+		fmt.Println("runtime.Caller error")
+		return
+	}
+	r := &Record{
+		RLevel: LevelDebug,
+		RTime:  l.GetPreTimeStr(),
+		RMsg:   fmt.Sprintf(format, args...),
+		LineNum:line,
+		File: file,
+	}
+	l.RecordCh <- r
+}
+
 func ( l *Logger) Infof (format string, args ...interface{}) {
 	_, file, line, ok := runtime.Caller(1)
 	if !ok {
@@ -139,6 +198,38 @@ func ( l *Logger) Infof (format string, args ...interface{}) {
 	}
 	r := &Record{
 		RLevel: LevelInfo,
+		RTime:  l.GetPreTimeStr(),
+		RMsg:   fmt.Sprintf(format, args...),
+		LineNum:line,
+		File: file,
+	}
+	l.RecordCh <- r
+}
+
+func ( l *Logger) Warnf (format string, args ...interface{}) {
+	_, file, line, ok := runtime.Caller(1)
+	if !ok {
+		fmt.Println("runtime.Caller error")
+		return
+	}
+	r := &Record{
+		RLevel: LevelWarning,
+		RTime:  l.GetPreTimeStr(),
+		RMsg:   fmt.Sprintf(format, args...),
+		LineNum:line,
+		File: file,
+	}
+	l.RecordCh <- r
+}
+
+func ( l *Logger) Errorf (format string, args ...interface{}) {
+	_, file, line, ok := runtime.Caller(1)
+	if !ok {
+		fmt.Println("runtime.Caller error")
+		return
+	}
+	r := &Record{
+		RLevel: LevelError,
 		RTime:  l.GetPreTimeStr(),
 		RMsg:   fmt.Sprintf(format, args...),
 		LineNum:line,
@@ -229,4 +320,32 @@ func IsWhenValid(when string) bool{
 
 func (r *Record) String() string {
 	return fmt.Sprintf("[%s] %s %s %s.%d\n", r.RTime, r.RLevel.String(), r.RMsg, filepath.Base(r.File), r.LineNum)
+}
+
+func ( l *Logger) GetRegexp() (*regexp.Regexp, error) {
+	switch l.When {
+	case "M":
+		reg, err := regexp.Compile(fmt.Sprintf(`^%s_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}\.log$`, l.FileName))
+		if err != nil {
+			fmt.Printf("regexp.Compile error:%v\n", err)
+			logger.ExitLogger()
+		}
+		return reg, nil
+	case "H":
+		reg, err := regexp.Compile(fmt.Sprintf(`^%s_\d{4}-\d{2}-\d{2}_\d{2}\.log$`, l.FileName))
+		if err != nil {
+			fmt.Printf("regexp.Compile error:%v\n", err)
+			logger.ExitLogger()
+		}
+		return reg, nil
+	case "D":
+		reg, err := regexp.Compile(fmt.Sprintf(`^%s_\d{4}-\d{2}-\d{2}\.log$`, l.FileName))
+		if err != nil {
+			fmt.Printf("regexp.Compile error:%v\n", err)
+			logger.ExitLogger()
+		}
+		return reg, nil
+	}
+
+	return nil, fmt.Errorf("logger when is invalid")
 }
