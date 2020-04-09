@@ -21,7 +21,6 @@ func (l Level) String() string{
 	case 3:
 		return "ERROR"
 	}
-
 	return ""
 }
 
